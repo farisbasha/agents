@@ -717,10 +717,6 @@ export class TestChatAgent extends AIChatAgent<Env> {
     return this._capturedRequestId;
   }
 
-  hasPendingInteractionForTest(): boolean {
-    return this.hasPendingInteraction();
-  }
-
   waitUntilStableForTest(options?: { timeout?: number }): Promise<boolean> {
     return this.waitUntilStable(options);
   }
