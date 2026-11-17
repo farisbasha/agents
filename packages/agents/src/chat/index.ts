@@ -307,6 +307,7 @@ export {
   chatRecoveryProgressReader,
   chatRecoveryStorageAdapter,
   type ChatRecoveryTurnBindings,
+  type ChatRecoveryAttemptScope,
   type ChatRecoveryScheduleReason,
   type ChatRecoveryScheduleCallback,
   type ChatRecoveryAdapter,
