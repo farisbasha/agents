@@ -9152,10 +9152,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
   ): Promise<void> {
     const requestId = crypto.randomUUID();
     const abortSignal = this._aborts.getSignal(requestId);
-    const detachExternal = this._aborts.linkExternal(
-      requestId,
-      options?.signal
-    );
+    const detachExternal = this._turns.linkExternal(requestId, options?.signal);
     const ignoredTools = (options as { tools?: unknown } | undefined)?.tools;
     if (
       ignoredTools != null &&
@@ -13624,7 +13621,9 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         break;
 
       case "cancel":
-        this._aborts.cancel(event.id);
+        // A user's stop: it also drops the continuations waiting on the
+        // turn it stops.
+        this._turns.cancel(event.id);
         await this._chatRecoveryEngine().tryCancelScheduledRecovery(event.id);
         break;
 
@@ -13898,7 +13897,9 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
 
   /** Abort every in-flight chat turn on this agent. */
   cancelAllChats(): void {
-    this._aborts.destroyAll();
+    // A stop of everything: it also drops the continuations that were
+    // waiting on the turn running now.
+    this._turns.stopAll();
   }
 
   protected abortRequest(requestId: string, reason?: unknown): void {
@@ -13921,7 +13922,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
    * teardown that runs on `chat-clear`.
    */
   protected abortAllRequests(): void {
-    this._aborts.destroyAll();
+    this._turns.stopAll();
   }
 
   private async _handleClear(connection?: Connection) {
@@ -14257,9 +14258,13 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
               requestId,
               timeoutMs: stallTimeoutMs
             });
-            this.abortRequest(
-              requestId,
-              new Error("chat stream stalled: inactivity watchdog fired")
+            // The runtime's own abort, not a stop: recovery continues
+            // the turn, so the continuations waiting on it are kept.
+            this._turns.runtimeAbort(() =>
+              this.abortRequest(
+                requestId,
+                new Error("chat stream stalled: inactivity watchdog fired")
+              )
             );
           }
         );
@@ -14807,9 +14812,13 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
             });
             // Tear down the upstream model stream so a hung provider/transport
             // is released; the watchdog's throw drives the terminal error below.
-            this.abortRequest(
-              requestId,
-              new Error("chat stream stalled: inactivity watchdog fired")
+            // The runtime's own abort, not a stop: recovery continues
+            // the turn, so the continuations waiting on it are kept.
+            this._turns.runtimeAbort(() =>
+              this.abortRequest(
+                requestId,
+                new Error("chat stream stalled: inactivity watchdog fired")
+              )
             );
           }
         );

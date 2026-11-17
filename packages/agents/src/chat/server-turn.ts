@@ -103,6 +103,16 @@ export interface ServerChatTurn<TInput = undefined> {
 export interface ServerTurnParts {
   queue: TurnQueue;
   aborts: AbortRegistry;
+  /**
+   * Link the caller's signal to the turn. `ChatTurns` passes its own
+   * `linkExternal`, so a signal that stops the running turn is a stop like
+   * any other and drops the continuations waiting on it. Defaults to the
+   * registry's plain link.
+   */
+  linkExternal?: (
+    requestId: string,
+    signal: AbortSignal | undefined
+  ) => () => void;
 }
 
 /**
@@ -136,7 +146,9 @@ export async function runServerTurn<TInput = undefined>(
   if (!signal) {
     throw new TypeError("runServerTurn: requestId must be a string");
   }
-  const detachExternal = aborts.linkExternal(requestId, turn.signal);
+  const detachExternal = parts.linkExternal
+    ? parts.linkExternal(requestId, turn.signal)
+    : aborts.linkExternal(requestId, turn.signal);
   let released = false;
   // Runs when the turn's work ends, and again after the queue for a turn
   // that never started. `_reply` and a reset can remove the controller

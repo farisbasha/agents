@@ -163,6 +163,7 @@ export {
   claimContinuation,
   continuationStreamEnded,
   continuationStreamStarted,
+  dropWaitingContinuations,
   replyFinalized,
   runContinuationTurn,
   settleContinuationTurn,
