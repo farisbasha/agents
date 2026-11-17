@@ -94,9 +94,11 @@ function setup(scenario: Scenario = {}) {
       await scenario.duringWait?.(harness);
       return scenario.ready ?? true;
     },
-    restoreRequestContext: (context) => {
-      log.push("context");
-      restored.push(context);
+    requestContext: {
+      applyRecovered: (context) => {
+        log.push("context");
+        if (context) restored.push(context);
+      }
     },
     reconcileAgentToolChildRuns: async () => {
       log.push("reconcile");

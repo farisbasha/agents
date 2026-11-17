@@ -480,6 +480,265 @@ describe("chat turn races", () => {
     tabB.close(1000);
   });
 
+  it("a new question settles the client tool call the earlier reply still waits on", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const seen = record(ws);
+    const agent = await getAgentByName(env.TestChatAgent, room);
+    const clientTools = [{ name: "testTool", description: "A client tool" }];
+    // Turn 1 ended on a call to a tool the client sent a schema for. Nobody
+    // has answered it.
+    await agent.setClientToolsForTest(clientTools);
+    await agent.persistMessages([user1, toolReply("assistant-1", "call-1")]);
+    expect(await agent.hasPendingInteractionForTest()).toBe(true);
+
+    // The user sends a new question instead of answering.
+    sendChatRequest(
+      ws,
+      "req-2",
+      [user1, toolReply("assistant-1", "call-1"), user2],
+      { clientTools }
+    );
+    await waitUntil(() => responses(seen, "req-2").some((m) => m.done));
+    await agent.waitForIdleForTest();
+
+    // The model request held no call without a result (a provider rejects
+    // one), and the call is stored as failed.
+    expect(await agent.getChatMessageCallCountForTest()).toBe(1);
+    expect(await agent.getUnansweredAtModelCallForTest()).toEqual([]);
+    // The text tells the model the truth: the client's tool may have run.
+    const stored = (await agent.getPersistedMessages()) as ChatMessage[];
+    expect(stored[1].parts[0]).toMatchObject({
+      toolCallId: "call-1",
+      state: "output-error",
+      errorText:
+        "The conversation moved on before this tool call was answered. The tool may still have run."
+    });
+    expect(await agent.hasPendingInteractionForTest()).toBe(false);
+
+    // A late answer changes nothing and continues nothing.
+    send(ws, toolResult("call-1"));
+    await delay(300);
+    await agent.waitForIdleForTest();
+    expect(await agent.getChatMessageCallCountForTest()).toBe(1);
+    expect(
+      ((await agent.getPersistedMessages()) as ChatMessage[])[1].parts[0]
+    ).toMatchObject({ state: "output-error" });
+    ws.close(1000);
+  });
+
+  it("reports the calls a turn settles on the transcript channel", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const seen = record(ws);
+    const agent = await getAgentByName(env.TestChatAgent, room);
+    await agent.persistMessages([user1, toolReply("assistant-1", "call-1")]);
+
+    const repaired: Array<string[] | undefined> = [];
+    const unsubscribe = subscribe("transcript", (event) => {
+      if (event.type === "chat:transcript:repaired" && event.name === room) {
+        repaired.push(event.payload.toolCallIds);
+      }
+    });
+    try {
+      sendChatRequest(ws, "req-2", [
+        user1,
+        toolReply("assistant-1", "call-1"),
+        user2
+      ]);
+      await waitUntil(() => responses(seen, "req-2").some((m) => m.done));
+      await agent.waitForIdleForTest();
+    } finally {
+      unsubscribe();
+    }
+
+    expect(repaired).toEqual([["call-1"]]);
+    ws.close(1000);
+  });
+
+  it("a tool result that lists no client tools continues with the stored ones", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const agent = await getAgentByName(env.TestChatAgent, room);
+    const clientTools = [{ name: "testTool", description: "A client tool" }];
+    await agent.setClientToolsForTest(clientTools);
+    await agent.persistMessages([user1, toolReply("assistant-1", "call-1")]);
+
+    // The answering tab lists no tools of its own. The continuation still
+    // belongs to the turn whose request stored the tools.
+    send(ws, { ...toolResult("call-1"), clientTools: [] });
+    await waitUntil(
+      async () => (await agent.getChatMessageCallCountForTest()) === 1
+    );
+    await agent.waitForIdleForTest();
+
+    expect(await agent.getCapturedClientTools()).toEqual(clientTools);
+    ws.close(1000);
+  });
+
+  it("a new question settles an approval the user never gave", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const seen = record(ws);
+    const agent = await getAgentByName(env.TestChatAgent, room);
+    const approval: ChatMessage = {
+      id: "assistant-1",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-testTool",
+          toolCallId: "call-1",
+          state: "approval-requested",
+          input: {},
+          approval: { id: "approval-1" }
+        }
+      ] as ChatMessage["parts"]
+    };
+    await agent.persistMessages([user1, approval]);
+
+    sendChatRequest(ws, "req-2", [user1, approval, user2]);
+    await waitUntil(() => responses(seen, "req-2").some((m) => m.done));
+    await agent.waitForIdleForTest();
+
+    expect(await agent.getUnansweredAtModelCallForTest()).toEqual([]);
+    const stored = (await agent.getPersistedMessages()) as ChatMessage[];
+    expect(stored[1].parts[0]).toMatchObject({
+      toolCallId: "call-1",
+      state: "output-error",
+      errorText:
+        "The conversation moved on before this tool call was approved or denied. It did not run."
+    });
+    ws.close(1000);
+  });
+
+  it("a duplicate tool result from another tab leaves the stored tools", async () => {
+    const room = crypto.randomUUID();
+    const { ws: tabA } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const { ws: tabB } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const agent = await getAgentByName(env.TestChatAgent, room);
+    const toolsOfA = [{ name: "testTool", description: "Tab A's tool" }];
+    const toolsOfB = [{ name: "otherTool", description: "Tab B's tool" }];
+    await agent.setClientToolsForTest(toolsOfA);
+    await agent.persistMessages([user1, toolReply("assistant-1", "call-1")]);
+
+    // Tab A's result settles the call and lists its tools.
+    send(tabA, { ...toolResult("call-1"), clientTools: toolsOfA });
+    await waitUntil(
+      async () => (await agent.getChatMessageCallCountForTest()) === 1
+    );
+    await agent.waitForIdleForTest();
+
+    // Tab B answers the same call late, listing other tools. Its result
+    // settles nothing, so it must not change which tools the chat offers
+    // the model, or which calls a client owns.
+    send(tabB, { ...toolResult("call-1"), clientTools: toolsOfB });
+    await delay(300);
+    await agent.waitForIdleForTest();
+
+    expect(await agent.getStoredClientToolsForTest()).toEqual(toolsOfA);
+    expect(await agent.getChatMessageCallCountForTest()).toBe(1);
+    tabA.close(1000);
+    tabB.close(1000);
+  });
+
+  it("a tool result that settles its call replaces the stored tools for its continuation", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const agent = await getAgentByName(env.TestChatAgent, room);
+    const newer = [{ name: "otherTool", description: "A newer schema" }];
+    await agent.setClientToolsForTest([
+      { name: "testTool", description: "A client tool" }
+    ]);
+    await agent.persistMessages([user1, toolReply("assistant-1", "call-1")]);
+
+    send(ws, { ...toolResult("call-1"), clientTools: newer });
+    await waitUntil(
+      async () => (await agent.getChatMessageCallCountForTest()) === 1
+    );
+    await agent.waitForIdleForTest();
+
+    expect(await agent.getStoredClientToolsForTest()).toEqual(newer);
+    expect(await agent.getCapturedClientTools()).toEqual(newer);
+    ws.close(1000);
+  });
+
+  it("a reply that ends in reasoning is never sent to the model that way", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const seen = record(ws);
+    const agent = await getAgentByName(env.TestChatAgent, room);
+    // An earlier reply was cut off right after the model's reasoning, and an
+    // older version stored it as it was. Anthropic rejects every later
+    // request that holds it: "The final block in an assistant message
+    // cannot be thinking".
+    const cutOff: ChatMessage = {
+      id: "assistant-1",
+      role: "assistant",
+      parts: [
+        { type: "step-start" },
+        { type: "text", text: "Looking into it." },
+        { type: "step-start" },
+        {
+          type: "reasoning",
+          text: "Let me think",
+          state: "done",
+          providerMetadata: { anthropic: { signature: "sig" } }
+        }
+      ] as ChatMessage["parts"]
+    };
+    await agent.persistMessages([user1, cutOff]);
+
+    const repaired: Array<number | undefined> = [];
+    const unsubscribe = subscribe("transcript", (event) => {
+      if (event.type === "chat:transcript:repaired" && event.name === room) {
+        repaired.push(event.payload.removedReasoningParts);
+      }
+    });
+    try {
+      sendChatRequest(ws, "req-2", [user1, cutOff, user2]);
+      await waitUntil(() => responses(seen, "req-2").some((m) => m.done));
+      await agent.waitForIdleForTest();
+    } finally {
+      unsubscribe();
+    }
+
+    expect(await agent.getChatMessageCallCountForTest()).toBe(1);
+    expect(await agent.getEndsInReasoningAtModelCallForTest()).toEqual([]);
+    const stored = (await agent.getPersistedMessages()) as ChatMessage[];
+    expect(stored[1].parts.map((part) => part.type)).toEqual([
+      "step-start",
+      "text"
+    ]);
+    expect(repaired).toEqual([1]);
+    ws.close(1000);
+  });
+
+  it("a reply stopped right after the model's reasoning is stored without it", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const seen = record(ws);
+    const agent = await getAgentByName(env.TestChatAgent, room);
+
+    sendChatRequest(ws, "req-1", [user1], { reasoningThenHang: true });
+    await waitUntil(() =>
+      responses(seen, "req-1").some((m) => m.body.includes("reasoning-end"))
+    );
+    send(ws, { type: MessageType.CF_AGENT_CHAT_REQUEST_CANCEL, id: "req-1" });
+    await waitUntil(() => responses(seen, "req-1").some((m) => m.done));
+    await agent.waitForIdleForTest();
+
+    const stored = (await agent.getPersistedMessages()) as ChatMessage[];
+    expect(stored.at(-1)?.role).toBe("assistant");
+    expect(stored.at(-1)?.parts.some((part) => part.type === "reasoning")).toBe(
+      false
+    );
+    expect(stored.at(-1)?.parts.at(-1)).toMatchObject({
+      type: "text",
+      text: "Partial answer"
+    });
+    ws.close(1000);
+  });
+
   it("a tool result for an older reply does not continue the newer reply", async () => {
     const room = crypto.randomUUID();
     const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);

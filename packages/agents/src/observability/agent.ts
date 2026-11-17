@@ -303,7 +303,7 @@ export type AgentObservabilityEvent =
          * Why it will not run: the reply it would continue already has its
          * answer, a newer message follows that reply, or it was stopped.
          */
-        reason: "answered" | "moved_on" | "stopped";
+        reason: "answered" | "moved_on" | "stopped" | "awaiting_client";
       }
     >
   | BaseEvent<
@@ -313,6 +313,8 @@ export type AgentObservabilityEvent =
         removedToolCalls: number;
         normalizedInputs: number;
         toolCallIds?: string[];
+        /** Reasoning parts removed from the end of assistant messages. */
+        removedReasoningParts?: number;
       }
     >
   | BaseEvent<

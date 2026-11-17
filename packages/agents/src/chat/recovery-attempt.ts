@@ -275,7 +275,7 @@ async function runAdmittedAttempt<
     // was interrupted. A payload that does not name them leaves the stored
     // ones.
     if (data && ("lastClientTools" in data || "lastBody" in data)) {
-      turns.restoreRequestContext({
+      turns.requestContext.applyRecovered({
         ...("lastClientTools" in data && {
           lastClientTools: data.lastClientTools ?? undefined
         }),

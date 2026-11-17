@@ -763,7 +763,7 @@ While a turn is being recovered, the agent broadcasts a `cf_agent_chat_recoverin
 
 > `@cloudflare/ai-chat` broadcasts the live signal but does not yet replay it on connect (a client connecting mid-recovery will not be re-told until it reconnects to an active stream).
 
-Transcript repairs — healing orphaned tool calls (preserving them as errored results rather than deleting them, so the record survives and the model does not silently re-run the tool) and normalizing malformed/stringified or missing tool inputs before a provider call — are emitted on the `transcript` channel.
+Transcript repairs — healing orphaned tool calls (preserving them as errored results rather than deleting them, so the record survives and the model does not silently re-run the tool) and normalizing malformed/stringified or missing tool inputs before a provider call — are emitted on the `transcript` channel as `chat:transcript:repaired`. The event is emitted for the repair before a turn and when recovery settles the reply it is about to continue. `removedReasoningParts` counts reasoning removed from the end of a reply.
 
 #### Guarding against stale recoveries
 
@@ -828,6 +828,8 @@ protected continueLastTurn(
 The optional `options.signal` accepts an external `AbortSignal` for cancellation, matching the `saveMessages` contract.
 
 Called automatically by the default recovery path. Can also be called manually from scheduled callbacks or other entry points. The optional `body` parameter merges with the saved `_lastBody`.
+
+When the call is skipped, `status` is `"skipped"` and `reason` says why: `"nothing-to-continue"` (no assistant message), `"cleared"` (the chat was cleared), or `"awaiting-client"` (the reply still waits on a client for a tool result or an approval). A skipped call changes nothing. See [When the user moves on without answering](./client-tools-continuation.md#when-the-user-moves-on-without-answering).
 
 #### Stashing recovery data
 

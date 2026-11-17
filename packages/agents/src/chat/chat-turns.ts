@@ -16,6 +16,8 @@
  * - a continuation runs only while the message it answers is still the latest
  *   ({@link takeContinuation}), and its turn runs and settles one way
  *   ({@link runContinuationTurn}, `continuation-turn.ts`);
+ * - before a turn calls the model, every tool call nothing will answer in
+ *   time is settled ({@link settleBeforeTurn});
  * - a cancel reaches a queued turn, a running turn, and a running recovery
  *   attempt ({@link cancel});
  * - a reset tears all of it down together ({@link reset});
@@ -30,6 +32,7 @@
  * `@cloudflare/think`, not a public API.
  */
 
+import type { UIMessage } from "ai";
 import { AbortRegistry } from "./abort-registry";
 import {
   TIMED_OUT,
@@ -41,6 +44,12 @@ import {
   type ContinuationSpec,
   type ToolInteractionOutcome
 } from "./auto-continuation-controller";
+import {
+  continuationWaitsOnClient,
+  repairTranscriptBeforeTurn,
+  type BeforeTurnRepairOptions,
+  type BeforeTurnRepairResult
+} from "./before-turn";
 import {
   ContinuationState,
   type ContinuationConnection,
@@ -65,6 +74,13 @@ import {
   type ServerChatTurn,
   type ServerTurnOutcome
 } from "./server-turn";
+import {
+  persistRepairedTranscript,
+  settleInterruptedReply,
+  settleReplyBeforeRecovery,
+  type RepairedTranscriptSink,
+  type RepairInterruptedToolPartsOptions
+} from "./repair-transcript";
 import {
   SubmitConcurrencyController,
   type SubmitConcurrencyDecision
@@ -278,6 +294,7 @@ export class ChatTurns<
       autoContinuation: this.autoContinuation,
       aborts: this.aborts,
       messages: () => host.messages(),
+      clientToolNames: () => host.clientToolNames(),
       streamed: new Map(),
       dropped: (event) => host.continuationDropped?.(event)
     };
@@ -614,6 +631,81 @@ export class ChatTurns<
    */
   replyFinalized(): void {
     replyFinalized(this.#continuationParts);
+  }
+
+  // ── Before a turn ──────────────────────────────────────────────────
+
+  /**
+   * Whether the message a continuation turn would continue still waits on a
+   * client. Ask it first, before the turn stores anything: when it is
+   * `true` there is nothing to continue yet, the turn ends as skipped, and
+   * the client's answer starts the continuation. See
+   * {@link continuationWaitsOnClient}.
+   */
+  continuationWaitsOnClient(
+    messages: ReadonlyArray<ChatTurnMessage> = this.host.messages()
+  ): boolean {
+    return continuationWaitsOnClient(messages, this.host.clientToolNames());
+  }
+
+  /**
+   * Settle what `messages` must not go to the model with, before a turn
+   * calls it, then store what changed and report it through `sink`. The one
+   * before-turn step both hosts run. See {@link repairTranscriptBeforeTurn}
+   * for the rule: a reply the conversation moved past keeps no unanswered
+   * call, a continuation turn keeps, in the message it continues, what a
+   * client is known to still answer, and no assistant message ends in
+   * reasoning.
+   *
+   * @param messages - The history the turn's model request is built from.
+   *   Its last message is the one a continuation turn continues.
+   * @returns The repaired messages and what changed. When `keptToolCallIds`
+   *   is not empty, the turn must not call the model.
+   */
+  async settleBeforeTurn(
+    messages: UIMessage[],
+    options: Omit<BeforeTurnRepairOptions, "clientToolNames">,
+    sink: RepairedTranscriptSink
+  ): Promise<BeforeTurnRepairResult> {
+    const result = repairTranscriptBeforeTurn(messages, {
+      ...options,
+      clientToolNames: this.host.clientToolNames()
+    });
+    await persistRepairedTranscript(messages, result, sink);
+    return result;
+  }
+
+  /**
+   * Settle the tool calls a cut-off reply left unanswered, before it is
+   * stored. A call the host's client is known to own is kept. See
+   * {@link settleInterruptedReply}.
+   */
+  settleInterruptedReply<TMessage extends UIMessage>(
+    message: TMessage,
+    repairPart: RepairInterruptedToolPartsOptions["repairPart"]
+  ): TMessage {
+    return settleInterruptedReply(message, {
+      repairPart,
+      clientToolNames: this.host.clientToolNames()
+    });
+  }
+
+  /**
+   * Settle and store the reply a recovery attempt is about to continue. See
+   * {@link settleReplyBeforeRecovery}.
+   */
+  settleBeforeRecovery(
+    messages: ReadonlyArray<UIMessage>,
+    continueReplyId: string,
+    repairPart: RepairInterruptedToolPartsOptions["repairPart"],
+    sink: RepairedTranscriptSink
+  ): Promise<void> {
+    return settleReplyBeforeRecovery(
+      messages,
+      continueReplyId,
+      { repairPart, clientToolNames: this.host.clientToolNames() },
+      sink
+    );
   }
 
   // ── Cancel and reset ───────────────────────────────────────────────

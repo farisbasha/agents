@@ -1,10 +1,15 @@
 import { describe, it, expect } from "vitest";
-import type { UIMessage } from "ai";
+import { convertToModelMessages, type UIMessage } from "ai";
 import {
+  persistRepairedTranscript,
   repairInterruptedToolParts,
   settleInterruptedReply,
+  settleReplyBeforeRecovery,
   streamChunksFinished,
-  toolPartHasSettledResult
+  stripTrailingReasoning,
+  toolPartHasSettledResult,
+  unsettledToolCallIds,
+  type RepairedTranscriptSink
 } from "../repair-transcript";
 
 type ChatMessage = UIMessage;
@@ -413,5 +418,276 @@ describe("streamChunksFinished", () => {
         { body: "not json" }
       ])
     ).toBe(false);
+  });
+});
+
+/** A sink that records what it was asked to store and report. */
+function recordingSink() {
+  const persisted: Array<{ changed: string[]; repaired: string[] }> = [];
+  const events: Array<Parameters<RepairedTranscriptSink["emitRepaired"]>[0]> =
+    [];
+  const sink: RepairedTranscriptSink = {
+    persist: async (changed, repaired) => {
+      persisted.push({
+        changed: changed.map((m) => m.id),
+        repaired: repaired.map((m) => m.id)
+      });
+    },
+    emitRepaired: (event) => void events.push(event)
+  };
+  return { sink, persisted, events };
+}
+
+const pendingCall = (id: string, tool = "search") =>
+  toolMsg(id, {
+    type: `tool-${tool}`,
+    toolCallId: `call-${id}`,
+    state: "input-available",
+    input: {}
+  });
+const textMsg = (id: string, role: "assistant" | "user" = "user") =>
+  ({ id, role, parts: [{ type: "text", text: id }] }) as ChatMessage;
+
+describe("persistRepairedTranscript", () => {
+  it("stores the changed messages and reports the repair once", async () => {
+    const messages = [textMsg("u1"), pendingCall("a1"), textMsg("u2")];
+    const { sink, persisted, events } = recordingSink();
+
+    await persistRepairedTranscript(messages, repair(messages), sink);
+
+    expect(persisted).toEqual([
+      { changed: ["a1"], repaired: ["u1", "a1", "u2"] }
+    ]);
+    expect(events).toEqual([
+      { removedToolCalls: 1, normalizedInputs: 0, toolCallIds: ["call-a1"] }
+    ]);
+  });
+
+  it("does nothing when the repair changed nothing", async () => {
+    const messages = [textMsg("u1"), textMsg("a1", "assistant")];
+    const { sink, persisted, events } = recordingSink();
+
+    await persistRepairedTranscript(messages, repair(messages), sink);
+
+    expect(persisted).toEqual([]);
+    expect(events).toEqual([]);
+  });
+});
+
+describe("settleReplyBeforeRecovery", () => {
+  const options = {
+    repairPart: flipToError,
+    clientToolNames: new Set(["pick"])
+  };
+
+  it("settles the reply a recovery continues, stores it and reports it", async () => {
+    const messages = [textMsg("u1"), pendingCall("a1")];
+    const { sink, persisted, events } = recordingSink();
+
+    await settleReplyBeforeRecovery(messages, "a1", options, sink);
+
+    expect(persisted).toEqual([{ changed: ["a1"], repaired: ["u1", "a1"] }]);
+    expect(events).toEqual([
+      { removedToolCalls: 1, normalizedInputs: 0, toolCallIds: ["call-a1"] }
+    ]);
+  });
+
+  it("keeps a call a client is known to own", async () => {
+    const messages = [textMsg("u1"), pendingCall("a1", "pick")];
+    const { sink, persisted, events } = recordingSink();
+
+    await settleReplyBeforeRecovery(messages, "a1", options, sink);
+
+    expect(persisted).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
+  it("leaves the transcript alone when the reply is not the latest message", async () => {
+    const { sink, persisted } = recordingSink();
+
+    await settleReplyBeforeRecovery(
+      [textMsg("u1"), pendingCall("a1"), textMsg("u2")],
+      "a1",
+      options,
+      sink
+    );
+    await settleReplyBeforeRecovery(
+      [textMsg("u1"), pendingCall("a1")],
+      "another-reply",
+      options,
+      sink
+    );
+
+    expect(persisted).toEqual([]);
+  });
+});
+
+describe("unsettledToolCallIds", () => {
+  it("lists calls with no result, and not an approved call waiting to run", () => {
+    const messages = [
+      pendingCall("a1"),
+      toolMsg("a2", {
+        type: "dynamic-tool",
+        toolName: "x",
+        toolCallId: "requested",
+        state: "approval-requested"
+      }),
+      toolMsg("a3", {
+        type: "tool-search",
+        toolCallId: "approved",
+        state: "approval-responded"
+      }),
+      toolMsg("a4", {
+        type: "tool-search",
+        toolCallId: "done",
+        state: "output-available",
+        output: 1
+      }),
+      textMsg("u1")
+    ];
+    expect(unsettledToolCallIds(messages)).toEqual(["call-a1", "requested"]);
+  });
+});
+
+describe("stripTrailingReasoning", () => {
+  const step = { type: "step-start" };
+  const reasoning = (text = "Let me think") => ({
+    type: "reasoning",
+    text,
+    state: "done",
+    providerMetadata: { anthropic: { signature: "sig" } }
+  });
+  const text = (value = "Answer") => ({ type: "text", text: value });
+  const tool = {
+    type: "tool-pick",
+    toolCallId: "call-1",
+    state: "output-available",
+    input: {},
+    output: 1
+  };
+  const assistant = (...parts: Array<Record<string, unknown>>) =>
+    ({
+      id: "a1",
+      role: "assistant",
+      parts: parts as unknown as ChatMessage["parts"]
+    }) as ChatMessage;
+  const types = (message: ChatMessage) => message.parts.map((p) => p.type);
+
+  /**
+   * The last block the provider is sent for this reply. The Anthropic
+   * provider joins consecutive assistant messages, so this is the last part
+   * of the last assistant message `convertToModelMessages` makes.
+   */
+  async function finalAssistantBlock(message: ChatMessage) {
+    const model = await convertToModelMessages([
+      { id: "u1", role: "user", parts: [{ type: "text", text: "q" }] },
+      message,
+      { id: "u2", role: "user", parts: [{ type: "text", text: "next" }] }
+    ]);
+    const last = model.filter((m) => m.role === "assistant").at(-1);
+    return Array.isArray(last?.content) ? last.content.at(-1)?.type : undefined;
+  }
+
+  it("removes a last step that holds only reasoning", async () => {
+    const message = assistant(step, tool, step, reasoning());
+    // As stored, the request's last assistant block is the reasoning.
+    expect(await finalAssistantBlock(message)).toBe("reasoning");
+
+    const stripped = stripTrailingReasoning(message);
+    expect(types(stripped)).toEqual(["step-start", "tool-pick"]);
+    expect(await finalAssistantBlock(stripped)).toBe("tool-call");
+  });
+
+  it("leaves a reply of reasoning alone with no parts, which sends nothing", async () => {
+    const stripped = stripTrailingReasoning(assistant(step, reasoning()));
+    expect(stripped.parts).toEqual([]);
+    expect(await finalAssistantBlock(stripped)).toBeUndefined();
+  });
+
+  it("removes reasoning that follows the text of the last step", async () => {
+    const message = assistant(step, text(), reasoning());
+    expect(await finalAssistantBlock(message)).toBe("reasoning");
+    const stripped = stripTrailingReasoning(message);
+    expect(types(stripped)).toEqual(["step-start", "text"]);
+  });
+
+  it("removes several trailing reasoning-only steps", () => {
+    expect(
+      types(
+        stripTrailingReasoning(
+          assistant(step, text(), step, reasoning("a"), step, reasoning("b"))
+        )
+      )
+    ).toEqual(["step-start", "text"]);
+  });
+
+  it("keeps reasoning that content follows, in the same step or a later one", async () => {
+    const sameStep = assistant(step, reasoning(), tool);
+    const laterStep = assistant(step, tool, step, reasoning(), step, text());
+    const before = assistant(step, reasoning(), text());
+    for (const message of [sameStep, laterStep, before]) {
+      expect(stripTrailingReasoning(message)).toBe(message);
+      expect(await finalAssistantBlock(message)).not.toBe("reasoning");
+    }
+  });
+
+  it("keeps parts that send nothing to the model, and treats empty text as nothing", () => {
+    const source = { type: "source-url", sourceId: "s", url: "https://x.y" };
+    expect(
+      types(
+        stripTrailingReasoning(
+          assistant(step, text(), step, reasoning(), text(""), source)
+        )
+      )
+    ).toEqual(["step-start", "text", "step-start", "text", "source-url"]);
+  });
+
+  it("leaves user messages and replies without trailing reasoning alone", () => {
+    const user = {
+      id: "u1",
+      role: "user",
+      parts: [{ type: "text", text: "hi" }]
+    } as ChatMessage;
+    const reply = assistant(step, text());
+    expect(stripTrailingReasoning(user)).toBe(user);
+    expect(stripTrailingReasoning(reply)).toBe(reply);
+  });
+
+  it("is applied when a cut-off reply is settled", () => {
+    const settled = settleInterruptedReply(
+      assistant(
+        step,
+        {
+          type: "tool-search",
+          toolCallId: "dead",
+          state: "input-available",
+          input: {}
+        },
+        step,
+        reasoning()
+      ),
+      { repairPart: flipToError, clientToolNames: new Set() }
+    );
+    expect(types(settled)).toEqual(["step-start", "tool-search"]);
+    expect(settled.parts[1]).toMatchObject({ state: "output-error" });
+  });
+
+  it("is reported with the repair, and stored like any other change", async () => {
+    const messages = [textMsg("u1"), assistant(step, reasoning())];
+    const result = repair(messages);
+    expect(result.removedReasoningParts).toBe(1);
+    expect(result.removedToolCalls).toBe(0);
+
+    const { sink, persisted, events } = recordingSink();
+    await persistRepairedTranscript(messages, result, sink);
+    expect(persisted).toEqual([{ changed: ["a1"], repaired: ["u1", "a1"] }]);
+    expect(events).toEqual([
+      {
+        removedToolCalls: 0,
+        normalizedInputs: 0,
+        toolCallIds: [],
+        removedReasoningParts: 1
+      }
+    ]);
   });
 });

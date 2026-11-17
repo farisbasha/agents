@@ -273,8 +273,6 @@ describe("ContinuationState", () => {
     state.deferred = {
       connection: conn,
       connectionId: "c1",
-      clientTools: [{ name: "tool1" }],
-      body: { key: "val" },
       errorPrefix: "[test]",
       prerequisite: null
     };
@@ -286,8 +284,6 @@ describe("ContinuationState", () => {
     expect(result).not.toBeNull();
     expect(result!.requestId).toBe("new-req-id");
     expect(result!.connection).toBe(conn);
-    expect(result!.clientTools).toEqual([{ name: "tool1" }]);
-    expect(result!.body).toEqual({ key: "val" });
     expect(result!.errorPrefix).toBe("[test]");
     expect(result!.pastCoalesce).toBe(false);
 

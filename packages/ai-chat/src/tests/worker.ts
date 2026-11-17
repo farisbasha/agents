@@ -338,6 +338,25 @@ export class TestChatAgent extends AIChatAgent<Env> {
     options?: OnChatMessageOptions
   ) {
     this._chatMessageCallCount++;
+    // What the model request would hold: tool calls with no result.
+    this._unansweredAtModelCall = this.messages.flatMap((message) =>
+      message.parts.flatMap((part) => {
+        const record = part as { toolCallId?: string; state?: string };
+        return record.toolCallId &&
+          (record.state === "input-available" ||
+            record.state === "approval-requested")
+          ? [record.toolCallId]
+          : [];
+      })
+    );
+    // Assistant messages the model request would end a turn of in reasoning.
+    this._endsInReasoningAtModelCall = this.messages
+      .filter(
+        (message) =>
+          message.role === "assistant" &&
+          message.parts.at(-1)?.type === "reasoning"
+      )
+      .map((message) => message.id);
     // Capture the body, clientTools, and requestId from options for testing
     this._capturedBody = options?.body;
     this._capturedClientTools = options?.clientTools;
@@ -417,6 +436,34 @@ export class TestChatAgent extends AIChatAgent<Env> {
                 toolName: "slowServerTool",
                 input: {}
               }
+            ]) {
+              controller.enqueue(
+                encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`)
+              );
+            }
+          },
+          cancel() {}
+        }),
+        { headers: { "Content-Type": "text/event-stream" } }
+      );
+    }
+
+    // The reply writes text, then the model's reasoning, and never
+    // finishes: only a stop, a stall or an eviction ends it.
+    if (options?.body?.reasoningThenHang === true) {
+      const encoder = new TextEncoder();
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const chunk of [
+              { type: "start" },
+              { type: "start-step" },
+              { type: "text-start", id: "t" },
+              { type: "text-delta", id: "t", delta: "Partial answer" },
+              { type: "text-end", id: "t" },
+              { type: "reasoning-start", id: "r" },
+              { type: "reasoning-delta", id: "r", delta: "Let me think" },
+              { type: "reasoning-end", id: "r" }
             ]) {
               controller.enqueue(
                 encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`)
@@ -877,6 +924,30 @@ export class TestChatAgent extends AIChatAgent<Env> {
 
   abortAllRequestsForTest(): void {
     this.abortAllRequests();
+  }
+
+  private _unansweredAtModelCall: string[] = [];
+
+  private _endsInReasoningAtModelCall: string[] = [];
+
+  /** Assistant messages that ended in reasoning when the model was called. */
+  getEndsInReasoningAtModelCallForTest(): string[] {
+    return this._endsInReasoningAtModelCall;
+  }
+
+  /** The client tools stored for later turns. */
+  getStoredClientToolsForTest(): ClientToolSchema[] | undefined {
+    return this._lastClientTools;
+  }
+
+  /** Store client tools as a request that sent them would. */
+  setClientToolsForTest(clientTools: ClientToolSchema[]): void {
+    this._lastClientTools = clientTools;
+  }
+
+  /** Tool calls with no result in the transcript the last turn's model saw. */
+  getUnansweredAtModelCallForTest(): string[] {
+    return this._unansweredAtModelCall;
   }
 
   hasPendingInteractionForTest(): boolean {
@@ -3814,6 +3885,14 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
         lastClientTools?: ClientToolSchema[] | null;
       }
     );
+  }
+
+  /** The request context stored for later turns. */
+  getRequestContextForTest(): {
+    body: Record<string, unknown> | undefined;
+    clientTools: ClientToolSchema[] | undefined;
+  } {
+    return { body: this._lastBody, clientTools: this._lastClientTools };
   }
 
   setRequestContextForTest(

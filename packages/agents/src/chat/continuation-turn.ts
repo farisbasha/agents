@@ -40,7 +40,7 @@
 import { isDurableObjectResetError } from "../retries";
 import type { AbortRegistry } from "./abort-registry";
 import type { AutoContinuationController } from "./auto-continuation-controller";
-import type { ClientToolSchema } from "./client-tools";
+import { continuationWaitsOnClient } from "./before-turn";
 import {
   continuationTargetIsLatest,
   type ContinuationConnection,
@@ -66,6 +66,8 @@ export interface ContinuationTurnParts<
     role: string;
     parts: ReadonlyArray<unknown>;
   }>;
+  /** Names of the tools a client is known to run (the schemas it sent). */
+  clientToolNames(): ReadonlySet<string>;
   /**
    * The continuation turns running now, by request id, and whether each
    * one's stream has started. {@link runContinuationBody} adds and removes
@@ -91,22 +93,25 @@ export interface ContinuationDropped {
    * - `moved_on`: a newer message follows the reply its tool result is in.
    * - `stopped`: it was stopped before it ran, in the queue or because the
    *   turn it was waiting on was stopped.
+   * - `awaiting_client`: the reply it would continue still waits on a
+   *   client for a tool result or an approval. The barrier holds a
+   *   continuation until its batch is answered, so this is a backstop. The
+   *   client's answer schedules a new continuation.
    */
-  reason: "answered" | "moved_on" | "stopped";
+  reason: "answered" | "moved_on" | "stopped" | "awaiting_client";
 }
 
 /**
- * What a continuation turn runs with: its request id, and the connection
- * and tools of the latest result that scheduled it. `connection` is
- * `undefined` for a continuation no connection scheduled.
+ * What a continuation turn runs with: its request id, and the connection of
+ * the latest result that scheduled it. `connection` is `undefined` for a
+ * continuation no connection scheduled. The host reads the tools and body
+ * from the stored request context when the turn starts.
  */
 export interface ContinuationContext<
   TConnection extends ContinuationConnection = ContinuationConnection
 > {
   requestId: string;
   connection: TConnection | undefined;
-  clientTools?: ClientToolSchema[];
-  body?: Record<string, unknown>;
 }
 
 /**
@@ -173,6 +178,18 @@ export function claimContinuation<TConnection extends ContinuationConnection>(
 }
 
 /**
+ * Whether the last message still waits on a client for a tool result or an
+ * approval. A continuation has nothing to continue until the client
+ * answers: the request would hold a tool call with no result
+ * ({@link continuationWaitsOnClient}).
+ */
+function replyWaitsOnClient<TConnection extends ContinuationConnection>(
+  parts: ContinuationTurnParts<TConnection>
+): boolean {
+  return continuationWaitsOnClient(parts.messages(), parts.clientToolNames());
+}
+
+/**
  * {@link claimContinuation}, saying why there is nothing to continue.
  * `dropped` is `null` when the turn's own continuation is already gone:
  * whoever removed it reported that.
@@ -195,6 +212,7 @@ function tryClaimContinuation<TConnection extends ContinuationConnection>(
     }
     if (transcriptEndsInAnswer(messages)) return { dropped: "answered" };
   }
+  if (replyWaitsOnClient(parts)) return { dropped: "awaiting_client" };
   pending.pastCoalesce = true;
   return { continuation: pending };
 }
@@ -261,7 +279,11 @@ export async function runContinuationTurn<
       parts.dropped({ requestId, reason: "stopped" });
       return null;
     }
-    if (unscheduled) return unscheduled.continuation;
+    if (unscheduled) {
+      if (!replyWaitsOnClient(parts)) return unscheduled.continuation;
+      parts.dropped({ requestId, reason: "awaiting_client" });
+      return null;
+    }
     const claimed = tryClaimContinuation(parts, requestId);
     if ("continuation" in claimed) return claimed.continuation;
     if (claimed.dropped) parts.dropped({ requestId, reason: claimed.dropped });

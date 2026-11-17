@@ -97,9 +97,26 @@ export type SaveMessagesResult = {
   requestId: string;
   /** Whether the turn completed, errored, was skipped, or was aborted. */
   status: "completed" | "error" | "skipped" | "aborted";
+  /** Why the turn was skipped, when `status` is `"skipped"`. */
+  reason?: SkippedTurnReason;
   /** Error message when `status` is `"error"`. */
   error?: string;
 };
+
+/**
+ * Why a turn was skipped without calling the model.
+ *
+ * - `"cleared"`: the chat was cleared before or while the turn ran.
+ * - `"nothing-to-continue"`: `continueLastTurn()` found no assistant
+ *   message to continue.
+ * - `"awaiting-client"`: `continueLastTurn()` found the reply still waiting
+ *   on a client, for a tool result or an approval. Nothing was changed. The
+ *   client's answer starts the continuation.
+ */
+export type SkippedTurnReason =
+  | "cleared"
+  | "nothing-to-continue"
+  | "awaiting-client";
 
 /**
  * Context passed to the `onChatRecovery` hook when an interrupted chat

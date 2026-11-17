@@ -81,8 +81,6 @@ describe("AutoContinuationController", () => {
   function schedule(connId = "c1") {
     controller.schedule({
       connection: makeConnection(connId),
-      clientTools: undefined,
-      body: undefined,
       errorPrefix: "[test] continuation failed:"
     });
   }
@@ -257,8 +255,6 @@ describe("AutoContinuationController", () => {
     host.continuation.deferred = {
       connection: makeConnection("c2"),
       connectionId: "c2",
-      clientTools: undefined,
-      body: undefined,
       errorPrefix: "[test]",
       prerequisite: null
     };
@@ -369,8 +365,6 @@ describe("AutoContinuationController", () => {
 
   const spec = () => ({
     connection: makeConnection("c1"),
-    clientTools: undefined,
-    body: undefined,
     errorPrefix: "[test] continuation failed:"
   });
 

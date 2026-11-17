@@ -27,7 +27,7 @@
  */
 
 import type { AbortRegistry } from "./abort-registry";
-import type { SaveMessagesResult } from "./lifecycle";
+import type { SaveMessagesResult, SkippedTurnReason } from "./lifecycle";
 import type { TurnQueue } from "./turn-queue";
 
 export type ServerTurnStatus = SaveMessagesResult["status"];
@@ -35,6 +35,8 @@ export type ServerTurnStatus = SaveMessagesResult["status"];
 /** How a server-started turn ended. */
 export interface ServerTurnOutcome {
   status: ServerTurnStatus;
+  /** Why the turn was skipped, when `status` is `"skipped"`. */
+  reason?: SkippedTurnReason;
   /** The error message, when `status` is `"error"`. */
   error?: string;
 }
@@ -45,6 +47,8 @@ export type ServerTurnPrepared<TInput> =
   | {
       /** End the turn here with this status. Nothing is stored. */
       declined: Extract<ServerTurnStatus, "aborted" | "skipped">;
+      /** Why, for a turn declined as `skipped`. */
+      reason?: SkippedTurnReason;
     };
 
 /**
@@ -177,7 +181,10 @@ export async function runServerTurn<TInput = undefined>(
     if (turn.prepare) {
       const prepared = await turn.prepare({ isCurrent });
       if ("declined" in prepared) {
-        outcome = { status: prepared.declined };
+        outcome = {
+          status: prepared.declined,
+          ...(prepared.reason !== undefined && { reason: prepared.reason })
+        };
         declined = true;
         return;
       }
@@ -218,7 +225,9 @@ export async function runServerTurn<TInput = undefined>(
       }
       return outcome.status;
     }, generation);
-    if (admitted === "stale") outcome = { status: "skipped" };
+    if (admitted === "stale") {
+      outcome = { status: "skipped", reason: "cleared" };
+    }
   } finally {
     release();
   }
@@ -237,8 +246,8 @@ export async function runServerTurn<TInput = undefined>(
  *
  * - An `error` stands.
  * - A reset since the turn was admitted wins over everything else:
- *   `skipped`. Nothing of the turn is left to report, whether the reset
- *   came before the reply or cut it off.
+ *   `skipped`, with the reason `cleared`. Nothing of the turn is left to
+ *   report, whether the reset came before the reply or cut it off.
  * - A turn stopped before its reply path reported anything (`run` was not
  *   called, or returned nothing) is `aborted`.
  * - An outcome the reply path reported stands. A stop that lands after a
@@ -256,7 +265,7 @@ export function mapServerTurnOutcome(
   }
 ): ServerTurnOutcome {
   if (outcome.status === "error") return outcome;
-  if (state.reset) return { status: "skipped" };
+  if (state.reset) return { status: "skipped", reason: "cleared" };
   if (!state.reported && state.aborted) return { status: "aborted" };
   return outcome;
 }
@@ -278,8 +287,12 @@ export function toSaveMessagesResult(
   outcome: ServerTurnOutcome
 ): SaveMessagesResult {
   return {
-    requestId,
+    // Nothing ran under the id of a turn that found the reply waiting on a
+    // client, as for a turn with no reply to continue.
+    requestId: outcome.reason === "awaiting-client" ? "" : requestId,
     status: outcome.status,
+    ...(outcome.status === "skipped" &&
+      outcome.reason !== undefined && { reason: outcome.reason }),
     ...(outcome.error !== undefined && { error: outcome.error })
   };
 }

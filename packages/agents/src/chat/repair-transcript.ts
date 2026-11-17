@@ -20,6 +20,8 @@
 
 import type { UIMessage } from "ai";
 import { normalizeToolInput } from "./message-builder";
+import { cutOffReplyToSettle } from "./recovery-attempt";
+import { partAwaitsClientInteraction } from "./tool-state";
 
 /**
  * Whether a tool part already has a settled result the provider accepts, so it
@@ -42,6 +44,71 @@ export function toolPartHasSettledResult(
     state === "output-error" ||
     state === "output-denied"
   );
+}
+
+/** The tool call id of a tool part, or `undefined` for any other part. */
+function toolCallIdOf(record: Record<string, unknown>): string | undefined {
+  const isToolPart =
+    typeof record.type === "string" &&
+    (record.type.startsWith("tool-") || record.type === "dynamic-tool");
+  return isToolPart &&
+    typeof record.toolCallId === "string" &&
+    record.toolCallId.length > 0
+    ? record.toolCallId
+    : undefined;
+}
+
+/**
+ * Remove the reasoning an assistant message ends in.
+ *
+ * Anthropic rejects a request in which an assistant message's final block
+ * is a thinking block ("The final block in an assistant message cannot be
+ * `thinking`"), whether that message is the last one or a user message or a
+ * tool result follows it. A reply cut off right after the model's reasoning
+ * is stored in exactly that shape, and would fail every later request.
+ *
+ * `convertToModelMessages` turns each step of a UI message into its own
+ * assistant message, and the Anthropic provider joins consecutive ones. So
+ * reasoning is safe when anything the model is sent comes after it in the
+ * message (text, a file, a tool call), in the same step or a later one, and
+ * unsafe only at the end. This removes every reasoning part after the last
+ * such part, then the `step-start` markers left with nothing after them.
+ * Parts that send nothing to the model (sources, data parts) are kept.
+ *
+ * @returns The same message when it does not end in reasoning.
+ */
+export function stripTrailingReasoning<TMessage extends UIMessage>(
+  message: TMessage
+): TMessage {
+  if (message.role !== "assistant") return message;
+  let lastContent = -1;
+  for (let i = message.parts.length - 1; i >= 0; i--) {
+    if (partSendsContent(message.parts[i])) {
+      lastContent = i;
+      break;
+    }
+  }
+  const tail = message.parts.slice(lastContent + 1);
+  if (!tail.some((part) => part.type === "reasoning")) return message;
+  const kept = tail.filter((part) => part.type !== "reasoning");
+  while (kept.at(-1)?.type === "step-start") kept.pop();
+  return {
+    ...message,
+    parts: [...message.parts.slice(0, lastContent + 1), ...kept]
+  };
+}
+
+function countReasoning(message: UIMessage): number {
+  return message.parts.filter((part) => part.type === "reasoning").length;
+}
+
+/** Whether a part reaches the model as something other than reasoning. */
+function partSendsContent(part: UIMessage["parts"][number]): boolean {
+  const record = part as Record<string, unknown>;
+  if (record.type === "text") {
+    return typeof record.text === "string" && record.text.length > 0;
+  }
+  return record.type === "file" || toolCallIdOf(record) !== undefined;
 }
 
 export interface RepairInterruptedToolPartsOptions {
@@ -72,8 +139,14 @@ export interface RepairInterruptedToolPartsOptions {
    * interaction (an `input-available` client tool or an `approval-requested`
    * part the user may still answer) so it is left verbatim rather than clobbered
    * with an error. Skipped parts are not counted in `removedToolCalls`.
+   *
+   * `context.isLastMessage` is `true` for a part of the last message, the one
+   * no later message follows.
    */
-  shouldRepair?: (part: UIMessage["parts"][number]) => boolean;
+  shouldRepair?: (
+    part: UIMessage["parts"][number],
+    context: { isLastMessage: boolean }
+  ) => boolean;
   /**
    * Also repair `approval-responded` parts in any message a later message
    * follows. Pass `true` only when no continuation will execute them: a turn
@@ -95,6 +168,11 @@ export interface RepairInterruptedToolPartsResult {
   normalizedInputs: number;
   /** The tool-call ids that were repaired. */
   toolCallIds: string[];
+  /**
+   * Count of reasoning parts removed from the end of assistant messages
+   * ({@link stripTrailingReasoning}).
+   */
+  removedReasoningParts: number;
 }
 
 /**
@@ -111,6 +189,9 @@ export interface RepairInterruptedToolPartsResult {
  *     `repairPart` (default: flipped to an errored result);
  *   - a tool part WITH a settled result only has its `input` normalized.
  *
+ * An assistant message that ends in reasoning has that reasoning removed
+ * ({@link stripTrailingReasoning}).
+ *
  * Messages with no changed part keep their original object reference so callers
  * can cheaply detect what to persist.
  */
@@ -125,6 +206,7 @@ export function repairInterruptedToolParts(
 
   let removedToolCalls = 0;
   let normalizedInputs = 0;
+  let removedReasoningParts = 0;
   const toolCallIds: string[] = [];
   const repaired: UIMessage[] = [];
 
@@ -134,13 +216,8 @@ export function repairInterruptedToolParts(
     let messageChanged = false;
     for (const part of message.parts) {
       const record = part as Record<string, unknown>;
-      const toolCallId =
-        typeof record.toolCallId === "string" ? record.toolCallId : undefined;
-      const isToolPart =
-        typeof record.type === "string" &&
-        (record.type.startsWith("tool-") || record.type === "dynamic-tool") &&
-        toolCallId;
-      if (!isToolPart) {
+      const toolCallId = toolCallIdOf(record);
+      if (toolCallId === undefined) {
         parts.push(part);
         continue;
       }
@@ -182,7 +259,7 @@ export function repairInterruptedToolParts(
         // clobber a tool-result / approval the client may still replay. Only
         // hosts whose default repair ERRORS the part opt into this; Think keeps
         // the default (repair everything, converting client tools via its hook).
-        if (!shouldRepair(part)) {
+        if (!shouldRepair(part, { isLastMessage })) {
           parts.push(part);
           continue;
         }
@@ -224,14 +301,21 @@ export function repairInterruptedToolParts(
       parts.push(part);
     }
 
-    repaired.push(messageChanged ? { ...message, parts } : message);
+    const settled = messageChanged ? { ...message, parts } : message;
+    const stripped = stripTrailingReasoning(settled);
+    if (stripped !== settled) {
+      removedReasoningParts +=
+        countReasoning(settled) - countReasoning(stripped);
+    }
+    repaired.push(stripped);
   }
 
   return {
     messages: repaired,
     removedToolCalls,
     normalizedInputs,
-    toolCallIds
+    toolCallIds,
+    removedReasoningParts
   };
 }
 
@@ -244,6 +328,10 @@ export function repairInterruptedToolParts(
  * it. Hosts call this on such a reply before they persist it, and on the
  * reply a recovery attempt is about to continue, so the stored transcript
  * never shows a call as running that nothing is running.
+ *
+ * Reasoning the reply ends in is removed too
+ * ({@link stripTrailingReasoning}): a reply cut off right after the model's
+ * reasoning would otherwise fail every later request.
  *
  * A call a client is known to own (`clientToolNames`, from the tool schemas
  * the client sent) is kept: the client replays its result after a reconnect.
@@ -259,36 +347,140 @@ export function repairInterruptedToolParts(
  */
 export function settleInterruptedReply<TMessage extends UIMessage>(
   message: TMessage,
-  options: {
-    repairPart: RepairInterruptedToolPartsOptions["repairPart"];
-    clientToolNames: ReadonlySet<string>;
-  }
+  options: SettleInterruptedReplyOptions
 ): TMessage {
-  const { messages } = repairInterruptedToolParts([message], {
-    repairPart: options.repairPart,
-    shouldRepair: (part) => !awaitsKnownClient(part, options.clientToolNames),
-    repairApprovalResponded: false
-  });
   // SAFETY: repairInterruptedToolParts returns the message it was given, or a
   // copy of it with repaired parts.
-  return messages[0] as TMessage;
+  return settleInterruptedReplyParts(message, options).messages[0] as TMessage;
 }
 
-function awaitsKnownClient(
-  part: UIMessage["parts"][number],
-  clientToolNames: ReadonlySet<string>
-): boolean {
-  const record = part as Record<string, unknown>;
-  if (record.state === "approval-requested") return true;
-  if (record.state !== "input-available") return false;
-  const type = typeof record.type === "string" ? record.type : "";
-  const name =
-    type === "dynamic-tool"
-      ? record.toolName
-      : type.startsWith("tool-")
-        ? type.slice("tool-".length)
-        : undefined;
-  return typeof name === "string" && clientToolNames.has(name);
+export interface SettleInterruptedReplyOptions {
+  repairPart: RepairInterruptedToolPartsOptions["repairPart"];
+  clientToolNames: ReadonlySet<string>;
+}
+
+function settleInterruptedReplyParts(
+  message: UIMessage,
+  options: SettleInterruptedReplyOptions
+): RepairInterruptedToolPartsResult {
+  return repairInterruptedToolParts([message], {
+    repairPart: options.repairPart,
+    shouldRepair: (part) =>
+      !partAwaitsClientInteraction(part, options.clientToolNames),
+    repairApprovalResponded: false
+  });
+}
+
+/**
+ * What a host does with a repaired transcript. The repair itself is the
+ * same for every host; where messages are stored is not.
+ */
+export interface RepairedTranscriptSink {
+  /**
+   * Store the repaired messages and show them to clients.
+   *
+   * @param changed - The messages whose parts the repair changed.
+   * @param repaired - The whole list the repair ran on, repaired.
+   */
+  persist(changed: UIMessage[], repaired: UIMessage[]): Promise<void>;
+  /** Emit the `chat:transcript:repaired` observability event. */
+  emitRepaired(event: {
+    removedToolCalls: number;
+    normalizedInputs: number;
+    toolCallIds: string[];
+    removedReasoningParts?: number;
+  }): void;
+}
+
+/**
+ * Store what a repair changed and report it, once. Does nothing when the
+ * repair changed nothing, which is the common case.
+ */
+export async function persistRepairedTranscript(
+  original: ReadonlyArray<UIMessage>,
+  result: RepairInterruptedToolPartsResult,
+  sink: RepairedTranscriptSink
+): Promise<void> {
+  if (
+    result.removedToolCalls === 0 &&
+    result.normalizedInputs === 0 &&
+    result.removedReasoningParts === 0
+  ) {
+    return;
+  }
+  const changed = result.messages.filter(
+    (message, index) => message !== original[index]
+  );
+  await sink.persist(changed, result.messages);
+  sink.emitRepaired({
+    removedToolCalls: result.removedToolCalls,
+    normalizedInputs: result.normalizedInputs,
+    toolCallIds: result.toolCallIds,
+    ...(result.removedReasoningParts > 0 && {
+      removedReasoningParts: result.removedReasoningParts
+    })
+  });
+}
+
+/**
+ * Settle and store the reply a recovery attempt is about to continue, before
+ * the attempt waits for the chat to be stable. That reply was cut off by
+ * definition. One this version stored is settled already; one an older
+ * version stored may hold a server tool call nothing will answer, and the
+ * attempt would otherwise wait on it as if a client could.
+ *
+ * Only the latest message is touched, and only when it is the reply the
+ * attempt continues and settling changes it (`cutOffReplyToSettle`). Earlier replies are left alone: the conversation has
+ * moved past them, nothing waits on them, and the turn that follows settles
+ * what they left unanswered.
+ */
+export async function settleReplyBeforeRecovery(
+  messages: ReadonlyArray<UIMessage>,
+  continueReplyId: string,
+  options: SettleInterruptedReplyOptions,
+  sink: RepairedTranscriptSink
+): Promise<void> {
+  let result: RepairInterruptedToolPartsResult | undefined;
+  const change = cutOffReplyToSettle(messages, continueReplyId, (reply) => {
+    result = settleInterruptedReplyParts(reply, options);
+    return result.messages[0];
+  });
+  if (!change || !result) return;
+  await persistRepairedTranscript(
+    messages,
+    {
+      ...result,
+      messages: messages.map((message) =>
+        message === change.stored ? change.settled : message
+      )
+    },
+    sink
+  );
+}
+
+/**
+ * Ids of the tool calls that still have no result. After the before-turn
+ * repair this holds only what the repair kept on purpose; anything else is a
+ * shape the repair missed. An `approval-responded` call is not counted: it
+ * is waiting for its turn to run it, and the AI SDK keeps it.
+ */
+export function unsettledToolCallIds(
+  messages: ReadonlyArray<UIMessage>,
+  isSettled: (
+    record: Record<string, unknown>
+  ) => boolean = toolPartHasSettledResult
+): string[] {
+  const ids: string[] = [];
+  for (const message of messages) {
+    for (const part of message.parts) {
+      const record = part as Record<string, unknown>;
+      const toolCallId = toolCallIdOf(record);
+      if (toolCallId === undefined) continue;
+      if (record.state === "approval-responded") continue;
+      if (!isSettled(record)) ids.push(toolCallId);
+    }
+  }
+  return ids;
 }
 
 /** Whether a stored chunk log holds the `finish` chunk of its stream. */

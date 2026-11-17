@@ -171,6 +171,39 @@ addToolOutput({
 });
 ```
 
+## When the user moves on without answering
+
+A client tool call or an approval request stays pending until a client answers it. If the user sends a new message first, the next turn settles every unanswered call in the earlier replies as an error before it calls the model. That includes a call the user approved that never ran. A provider rejects a request that holds a tool call with no result (`AI_MissingToolResultsError`), so the new message could not be answered otherwise.
+
+The error text tells the model what is known:
+
+| The call was                                        | `errorText`                                                                                  |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| A call to a tool the client sent with `clientTools` | "The conversation moved on before this tool call was answered. The tool may still have run." |
+| An approval request the user never answered         | "The conversation moved on before this tool call was approved or denied. It did not run."    |
+| A call the user approved that no turn ran           | "The tool call was approved but did not run before the next turn started."                   |
+| Any other call (a server tool cut off mid-run)      | "The tool call was interrupted before a result was recorded."                                |
+
+A result that arrives for a settled call is ignored. This is a real race: a tab can still be running the tool when the user, or another tab, sends the next message. The tool's effect happened, and the model was told only that it may have. Make a client tool with side effects safe to run twice, or override `repairInterruptedToolPart` to record the call in a way the model will not retry.
+
+`repairInterruptedToolPart` is called for every call a turn settles: a server tool cut off mid-run, a client tool call, an approval request, and an approved call. Override it to change what a settled call becomes, for example a text part that carries the question.
+
+A continuation turn settles the earlier replies the same way. In the message it continues, it keeps the calls a client can still answer: a call to a tool the client sent with `clientTools`, and an approval request. While there is one, there is nothing to continue yet. `continueLastTurn()` changes nothing, does not call `onChatMessage`, and returns `{ requestId: "", status: "skipped", reason: "awaiting-client" }`. The client's answer starts the continuation.
+
+`reason` says why a turn was skipped:
+
+| `reason`                | Meaning                                                             |
+| ----------------------- | ------------------------------------------------------------------- |
+| `"awaiting-client"`     | The reply still waits on a client for a tool result or an approval. |
+| `"nothing-to-continue"` | There is no assistant message to continue.                          |
+| `"cleared"`             | The chat was cleared before or while the turn ran.                  |
+
+The tools a turn offers the model are the `clientTools` of the request that started it. A request that sends none clears the stored ones. A tool result that settles its call and lists `clientTools` replaces them. A result that settles nothing, such as a late duplicate from another tab, leaves them.
+
+## Reasoning at the end of a reply
+
+A reply that is cut off right after the model's reasoning ends in a reasoning part. Anthropic rejects a request in which an assistant message's final block is a thinking block, whether a user message follows it or not, so one such reply would fail every later turn. The reasoning a reply ends in is removed when a cut-off reply is stored and before every turn. Reasoning that text or a tool call follows is kept.
+
 ## Related Docs
 
 - [Chat Agents](./chat-agents.md) — Full `AIChatAgent` and `useAgentChat` reference

@@ -206,18 +206,16 @@ import {
   crossMessageToolResultUpdate,
   toolApprovalUpdate,
   pausedExecutionUpdate,
-  partAwaitsClientInteraction,
-  clientResolvableToolNames,
+  ChatRequestContext,
   parseProtocolMessage,
   aiSdkRecoveryCodec,
   ResumeHandshake,
   normalizeToolInput,
   isLateToolInputChunk,
   lateToolInputForwardChunks,
-  repairInterruptedToolParts,
-  settleInterruptedReply,
+  interruptedToolPartAsError,
+  unsettledToolCallIds,
   streamChunksFinished,
-  toolPartHasSettledResult,
   persistReconstructedOrphan,
   reconcileMessages,
   CHAT_RECOVERY_TASK_NAME,
@@ -225,7 +223,6 @@ import {
   chatRecoveryStorageAdapter,
   createChatRecoveryTaskDefinition,
   createChatTurnTaskDefinition,
-  cutOffReplyToSettle,
   enqueueChatRecoveryTask,
   type StreamInterruptionOutcome,
   createChatFiberSnapshot,
@@ -263,6 +260,8 @@ import {
 import type { Streams } from "agents/streams";
 import type { ContinuationTurn, TurnFailureHost } from "agents/chat";
 import type {
+  BeforeTurnRepairResult,
+  RepairedTranscriptSink,
   StreamChunkData,
   ClientToolSchema,
   ClientToolExecutor,
@@ -2766,7 +2765,8 @@ export type {
   MessageConcurrency,
   ResolvedChatRecoveryConfig,
   SaveMessagesOptions,
-  SaveMessagesResult
+  SaveMessagesResult,
+  SkippedTurnReason
 } from "agents/chat";
 import type {
   ChatResponseResult,
@@ -3994,8 +3994,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
               }
             }
           );
-          this._restoreClientTools();
-          this._restoreBody();
+          this._requestContext.restore();
           this._setupProtocolHandlers();
           await this._initializeChannels();
         }
@@ -4108,45 +4107,17 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
   }
 
   /**
-   * Whether a tool part already has a settled result the provider accepts, so
-   * it must NOT be re-repaired into an errored result. Delegates to the shared
-   * `agents/chat` primitive so the repair pass and the backstop detector
-   * (`_incompleteToolCallIds`) share the single source of truth for terminal
-   * tool states.
-   */
-  private _toolPartHasSettledResult(record: Record<string, unknown>): boolean {
-    return toolPartHasSettledResult(record);
-  }
-
-  /**
-   * Tool-call ids that still have no recorded result. After repair this should
-   * be empty; a non-empty result means the backstop (`ignoreIncompleteToolCalls`)
-   * will drop those calls — i.e. repair missed a shape and should be extended.
+   * Tool-call ids that still have no recorded result (the shared
+   * `unsettledToolCallIds`). After repair this should be empty; a non-empty
+   * result means the backstop (`ignoreIncompleteToolCalls`) will drop those
+   * calls — i.e. repair missed a shape and should be extended.
    *
-   * `approval-responded` is deliberately excluded: an approved server tool has
-   * no result *yet*, but it is not incomplete or abandoned — it is waiting for
-   * its continuation to run `execute()`. `convertToModelMessages` keeps that
-   * call (and the SDK executes it), so flagging it here would log a misleading
-   * "repair gap" warning and emit a spurious `chat:transcript:repaired` event
-   * on every approval continuation.
+   * A continuation turn that keeps a call for a client never gets here: it
+   * does not call the model, and `_assembleModelMessages` refuses to build
+   * a request over one.
    */
   private _incompleteToolCallIds(messages: UIMessage[]): string[] {
-    const ids: string[] = [];
-    for (const message of messages) {
-      for (const part of message.parts) {
-        const record = part as Record<string, unknown>;
-        const toolCallId =
-          typeof record.toolCallId === "string" ? record.toolCallId : undefined;
-        const isToolPart =
-          typeof record.type === "string" &&
-          (record.type.startsWith("tool-") || record.type === "dynamic-tool") &&
-          toolCallId;
-        if (!isToolPart) continue;
-        if (record.state === "approval-responded") continue;
-        if (!this._toolPartHasSettledResult(record)) ids.push(toolCallId);
-      }
-    }
-    return ids;
+    return unsettledToolCallIds(messages);
   }
 
   /**
@@ -4177,93 +4148,51 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
   protected repairInterruptedToolPart(
     part: UIMessage["parts"][number]
   ): UIMessage["parts"][number] {
-    return {
-      ...part,
-      state: "output-error",
-      errorText:
-        (part as { state?: string }).state === "approval-responded"
-          ? "The tool call was approved but did not run before the next turn started."
-          : "The tool call was interrupted before a result was recorded."
-    } as UIMessage["parts"][number];
+    return interruptedToolPartAsError(part, {
+      clientToolNames: this._requestContext.clientToolNames()
+    });
   }
 
   /**
-   * Whether the inference being prepared may repair `approval-responded`
-   * parts: it is not a continuation, and no continuation is waiting to run
-   * them.
+   * Whether the turn running now continues the last message. The before-turn
+   * repair reads it. Set when the turn's inference is prepared and reset when
+   * the turn ends, so nothing outside a turn sees a stale `true`. Turns run
+   * one at a time on the turn queue, so there is one value at a time.
    */
-  private _repairApprovalRespondedThisTurn = false;
+  private _turnIsContinuation = false;
 
-  private async _mayRepairApprovalResponded(
-    continuation: boolean
-  ): Promise<boolean> {
-    if (continuation) return false;
-    if (this._continuation.pending || this._continuation.deferred) {
-      return false;
-    }
-    return (
-      (await this.getQueue(CONNECTIONLESS_CONTINUATION_QUEUE_ID)) === undefined
-    );
+  /**
+   * How a repaired transcript is stored and reported: update each changed
+   * message in the Session, patch the cached copy by id (the repaired list
+   * can be a cut or off-cache path), broadcast, then the
+   * `chat:transcript:repaired` event. Repair never deletes a message.
+   */
+  private _repairedTranscriptSink(): RepairedTranscriptSink {
+    return {
+      persist: async (changed) => {
+        // The copy the Session stored goes into the cache, and its growth
+        // is charged to the hydration budget. A message off the cached
+        // path (a cut history) is left out of the cache.
+        for (const message of changed) {
+          this._patchCachedMessage(await this._updateMessageInHistory(message));
+        }
+        this._broadcastMessages();
+      },
+      emitRepaired: (event) => this._emit("chat:transcript:repaired", event)
+    };
   }
 
-  private _repairToolTranscriptParts(
-    messages: UIMessage[],
-    options: { repairApprovalResponded?: boolean } = {}
-  ): {
-    messages: UIMessage[];
-    removedToolCalls: number;
-    normalizedInputs: number;
-    toolCallIds: string[];
-  } {
-    // Delegates to the shared `agents/chat` primitive so Think and ai-chat run
-    // identical repair logic. The overridable `repairInterruptedToolPart` hook
-    // (default: flip to an errored result; subclasses can preserve a
-    // client-resolved tool such as `ask_user` as text) is threaded through, and
-    // the settled-result / input-normalization helpers are the shared defaults.
-    return repairInterruptedToolParts(messages, {
-      repairPart: (part) => this.repairInterruptedToolPart(part),
-      isSettled: (record) => this._toolPartHasSettledResult(record),
-      normalizeInput: (input) => normalizeToolInput(input),
-      repairApprovalResponded: options.repairApprovalResponded
-    });
-  }
-
-  private async _repairTranscriptForProvider(
+  private _repairAndPersistTranscript(
     messages: UIMessage[]
-  ): Promise<UIMessage[]> {
-    const repair = this._repairToolTranscriptParts(messages, {
-      repairApprovalResponded: this._repairApprovalRespondedThisTurn
-    });
-    if (repair.removedToolCalls === 0 && repair.normalizedInputs === 0) {
-      return messages;
-    }
-
-    // Repair preserves every message (orphans are flipped to errored in place,
-    // never deleted), so there are no removed rows to delete — only updates.
-    for (const message of repair.messages) {
-      const original = messages.find(
-        (candidate) => candidate.id === message.id
-      );
-      if (original && original.parts !== message.parts) {
-        await this.session.updateMessage(message);
-      }
-    }
-
-    // `messages` can be a cut or off-cache path, so merge by id rather than
-    // replacing the cache with it.
-    const repairedById = new Map(
-      repair.messages.map((message) => [message.id, message])
+  ): Promise<BeforeTurnRepairResult> {
+    return this._turns.settleBeforeTurn(
+      messages,
+      {
+        continuation: this._turnIsContinuation,
+        repairPart: (part) => this.repairInterruptedToolPart(part)
+      },
+      this._repairedTranscriptSink()
     );
-    this._replaceCachedMessages(
-      this.messages.map((message) => repairedById.get(message.id) ?? message)
-    );
-    this._broadcastMessages();
-    this._emit("chat:transcript:repaired", {
-      removedToolCalls: repair.removedToolCalls,
-      normalizedInputs: repair.normalizedInputs,
-      toolCallIds: repair.toolCallIds
-    });
-    return repair.messages;
   }
 
   /**
@@ -4782,7 +4711,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       messages: () => this.messages,
       isReplyStreaming: () => this._streamingAssistant !== null,
       streamingReply: () => this._streamingAssistant?.toMessage() ?? null,
-      clientToolNames: () => this._clientResolvableToolNames(),
+      clientToolNames: () => this._requestContext.clientToolNames(),
       hasActiveStream: () => this._resumableStream.hasActiveStream(),
       generateRequestId: () => crypto.randomUUID(),
       keepAliveWhile: (fn) => this.keepAliveWhile(fn),
@@ -4805,8 +4734,29 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
   private _pendingResumeConnections: Set<string> = new Set();
   /** Lazily-built shared resume-handshake driver (Tier-2). */
   private _resumeHandshakeInstance: ResumeHandshake | null = null;
-  private _lastClientTools: ClientToolSchema[] | undefined;
-  private _lastBody: Record<string, unknown> | undefined;
+  /**
+   * The stored request context (the shared `ChatRequestContext`): the client
+   * tools and body of the most recent chat request, which continuations and
+   * recoveries run with. It owns when they change and writes them to
+   * `think_config`, skipping a value equal to what is stored.
+   */
+  private readonly _requestContext = new ChatRequestContext({
+    get: (key) => this._configGet(key),
+    set: (key, json) => this._configSet(key, json),
+    delete: (key) => this._configDelete(key)
+  });
+  private get _lastClientTools(): ClientToolSchema[] | undefined {
+    return this._requestContext.clientTools;
+  }
+  private set _lastClientTools(clientTools: ClientToolSchema[] | undefined) {
+    this._requestContext.clientTools = clientTools;
+  }
+  private get _lastBody(): Record<string, unknown> | undefined {
+    return this._requestContext.body;
+  }
+  private set _lastBody(body: Record<string, unknown> | undefined) {
+    this._requestContext.body = body;
+  }
   private readonly _continuation = this._turns.continuation;
   /**
    * Accepted-but-not-yet-streamed turns and the connections parked waiting for
@@ -5909,8 +5859,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
           this._activeChatRecoveryRootRequestId ?? requestId,
         continuation,
         messages: this.messages,
-        lastBody: this._lastBody,
-        lastClientTools: this._lastClientTools,
+        ...this._requestContext.snapshot(),
         originMessageIds: this._originMessageIdsFor(requestId)
       }),
       ...(branchParentId !== undefined && { branchParentId })
@@ -6874,14 +6823,14 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
    * storage. The cut comes before repair so messages past the leaf, which the
    * request never sees, are not rewritten.
    */
-  private async _turnHistory(): Promise<UIMessage[]> {
+  private async _turnHistory(): Promise<BeforeTurnRepairResult> {
     const leafId = this._turnHistoryLeafId;
     if (leafId === undefined) {
-      return this._repairTranscriptForProvider(this.messages);
+      return this._repairAndPersistTranscript(this.messages);
     }
     const cut = this.messages.findIndex((message) => message.id === leafId);
     if (cut >= 0) {
-      return this._repairTranscriptForProvider(this.messages.slice(0, cut + 1));
+      return this._repairAndPersistTranscript(this.messages.slice(0, cut + 1));
     }
     const budget = this.hydrationByteBudget;
     const path = (
@@ -6889,7 +6838,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         ? (await this.session.getRecentHistory(budget, { leafId })).messages
         : await this.session.getHistory({ leafId })
     ) as UIMessage[];
-    return this._repairTranscriptForProvider(path);
+    return this._repairAndPersistTranscript(path);
   }
 
   /**
@@ -6902,7 +6851,19 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
   private async _assembleModelMessages(
     tools: ToolSet
   ): Promise<Awaited<ReturnType<typeof convertToModelMessages>>> {
-    const history = await this._turnHistory();
+    const repair = await this._turnHistory();
+    // The rule holds where the request is built: a continuation turn whose
+    // repair kept a call a client still has to answer has nothing to
+    // continue. The continuation entry points end such a turn before it
+    // gets here (`ChatTurns.continuationWaitsOnClient`). One that did not
+    // must not reach the model: the request would hold a call with no
+    // result, and with it dropped the model calls the same tool again.
+    if (repair.keptToolCallIds.length > 0) {
+      throw new Error(
+        `[Think] A continuation turn cannot call the model while its reply waits on a client for tool call(s) ${repair.keptToolCallIds.join(", ")}.`
+      );
+    }
+    const history = repair.messages;
     const providerSafeHistory = history.map(
       toProviderSafeExecutionOutcomeMessage
     );
@@ -6914,7 +6875,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       keepRecent,
       toolOutputs: false
     }) as UIMessage[];
-    // `_repairTranscriptForProvider` above already heals orphan tool calls
+    // The before-turn repair above already heals orphan tool calls
     // (flipping them to errored results, preserving the record). This is the
     // last-line backstop: if any incomplete tool call still slips through
     // (compaction edge, addToolOutput race, an unrecognized part shape), drop it
@@ -6926,7 +6887,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     const incompleteAfterRepair = this._incompleteToolCallIds(truncated);
     if (incompleteAfterRepair.length > 0) {
       console.warn(
-        `[Think] ${incompleteAfterRepair.length} incomplete tool call(s) survived transcript repair and will be dropped by ignoreIncompleteToolCalls: ${incompleteAfterRepair.join(", ")}. This indicates a gap in _repairToolTranscriptParts.`
+        `[Think] ${incompleteAfterRepair.length} incomplete tool call(s) survived transcript repair and will be dropped by ignoreIncompleteToolCalls: ${incompleteAfterRepair.join(", ")}. This indicates a gap in the before-turn repair.`
       );
       this._emit("chat:transcript:repaired", {
         removedToolCalls: incompleteAfterRepair.length,
@@ -7218,8 +7179,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       this._approvedActionInputsFromTranscript();
     // Reset the proactive-compaction cap for this streamText run.
     this._proactiveCompactionsThisRun = 0;
-    this._repairApprovalRespondedThisTurn =
-      await this._mayRepairApprovalResponded(input.continuation);
+    this._turnIsContinuation = input.continuation;
     if (this.waitForMcpConnections) {
       const timeout =
         typeof this.waitForMcpConnections === "object"
@@ -8954,6 +8914,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
 
                 this._activeTurnReplyAttachments = [];
                 this._activeTurnReplyAttachmentsRequestId = spec.requestId;
+                this._turnIsContinuation = false;
 
                 try {
                   const value = await this._withChannelContext(
@@ -8995,6 +8956,8 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
                   });
                   update({ "cloudflare.agents.turn.status": "error" });
                   throw error;
+                } finally {
+                  this._turnIsContinuation = false;
                 }
               }
             )
@@ -12585,7 +12548,11 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     this._assertNotInsideAdmittedTurn(trigger);
     const lastLeaf = await this.session.getLatestLeaf();
     if (!lastLeaf || lastLeaf.role !== "assistant") {
-      return { requestId: "", status: "skipped" };
+      return {
+        requestId: "",
+        status: "skipped",
+        reason: "nothing-to-continue"
+      };
     }
 
     const requestId = crypto.randomUUID();
@@ -12606,6 +12573,14 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         body: body ?? options?.body,
         clientTools: options?.clientTools
       },
+      // Decided first, at the front of the queue, before the turn stores
+      // anything: while the reply still waits on a client there is nothing
+      // to continue, and a skipped call leaves the chat as it found it. The
+      // client's answer starts the continuation.
+      prepare: async () =>
+        this._turns.continuationWaitsOnClient()
+          ? { declined: "skipped", reason: "awaiting-client" }
+          : { input: [] },
       model: {
         continuation: true,
         workflowPrompt,
@@ -12786,24 +12761,20 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         break;
 
       case "tool-result": {
-        if (
-          event.clientTools &&
-          Array.isArray(event.clientTools) &&
-          event.clientTools.length > 0
-        ) {
-          this._lastClientTools = event.clientTools as ClientToolSchema[];
-          this._persistClientTools();
-        }
         // Only a result that settled its call continues, targeted at that
         // call's message; without autoContinue it re-arms a batch (#1650).
+        // Such a result also replaces the stored client tools with the ones
+        // it lists, so its continuation runs with the latest schemas. A
+        // duplicate or a result for a call that is gone changes nothing.
         this._turns.applyInteraction(
-          () =>
+          this._requestContext.applyingToolResult(event.clientTools, () =>
             this._applyToolResult(
               event.toolCallId,
               event.output,
               event.state as "output-error" | undefined,
               event.errorText
-            ),
+            )
+          ),
           event.autoContinue === true,
           () => this._continuationSpec(connection)
         );
@@ -12983,39 +12954,31 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
           // accepted would change what a continuation of the turn still
           // running uses, and a request cancelled or skipped in the queue
           // would leave its context behind.
-          const requestClientTools =
-            rawClientTools && rawClientTools.length > 0
-              ? rawClientTools
-              : undefined;
-          const requestBody =
-            Object.keys(customBody).length > 0 ? customBody : undefined;
-          withAgentSpan(
-            this,
-            "persist_chat_request_context",
-            "turn",
-            {
-              "cloudflare.agents.component": "think",
-              "cloudflare.agents.turn.request_id": requestId,
-              "cloudflare.agents.turn.trigger": "ws-chat"
-            },
-            () => {
-              if (requestClientTools) {
-                this._lastClientTools = requestClientTools;
-                this._persistClientTools();
-              } else if (rawClientTools !== undefined) {
-                this._lastClientTools = undefined;
-                this._persistClientTools();
-              }
-
-              this._lastBody = requestBody;
-              this._persistBody();
-            }
-          );
+          // The request's tools and body become the stored request context
+          // now that its turn runs. A request that sends no client tools
+          // clears the stored ones: the tools a turn offers the model are
+          // the ones the client that sent the request can run.
+          const { clientTools: clientToolsForTurn, body: bodyForTurn } =
+            withAgentSpan(
+              this,
+              "persist_chat_request_context",
+              "turn",
+              {
+                "cloudflare.agents.component": "think",
+                "cloudflare.agents.turn.request_id": requestId,
+                "cloudflare.agents.turn.trigger": "ws-chat"
+              },
+              () =>
+                this._requestContext.set({
+                  clientTools: rawClientTools,
+                  body: customBody
+                })
+            );
           await this._runModelTurn(requestId, abortSignal, {
             continuation: false,
             connection,
-            clientTools: this._lastClientTools,
-            body: this._lastBody,
+            clientTools: clientToolsForTurn,
+            body: bodyForTurn,
             parentId: branchParentId
           });
         },
@@ -13133,10 +13096,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
 
     this._resumableStream.clearAll();
     this._pendingResumeConnections.clear();
-    this._lastClientTools = undefined;
-    this._persistClientTools();
-    this._lastBody = undefined;
-    this._persistBody();
+    this._requestContext.clear();
     await this._clearHistory();
     this._broadcast(
       { type: MSG_CHAT_CLEAR },
@@ -14511,10 +14471,9 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
    * reply whose stream did not finish, before it is stored.
    */
   private _settleInterruptedReply(message: UIMessage): UIMessage {
-    return settleInterruptedReply(message, {
-      repairPart: (part) => this.repairInterruptedToolPart(part),
-      clientToolNames: this._clientResolvableToolNames()
-    });
+    return this._turns.settleInterruptedReply(message, (part) =>
+      this.repairInterruptedToolPart(part)
+    );
   }
 
   /**
@@ -14528,29 +14487,13 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
    * nothing waits on them, and the turn that follows settles what they left
    * unanswered.
    */
-  private async _settleBeforeRecovery(continueReplyId: string): Promise<void> {
-    const change = cutOffReplyToSettle(
+  private _settleBeforeRecovery(continueReplyId: string): Promise<void> {
+    return this._turns.settleBeforeRecovery(
       this.messages,
       continueReplyId,
-      (reply) => this._settleInterruptedReply(reply)
+      (part) => this.repairInterruptedToolPart(part),
+      this._repairedTranscriptSink()
     );
-    if (!change) return;
-    const { stored: leaf, settled } = change;
-    this._patchCachedMessage(await this._updateMessageInHistory(settled));
-    // Broadcast whatever the repair made of the calls: a host can turn one
-    // into a text part, which carries no tool call id.
-    this._broadcastMessages();
-    const toolCallIds = leaf.parts.flatMap((part, index) => {
-      const id = (part as { toolCallId?: unknown }).toolCallId;
-      return part !== settled.parts[index] && typeof id === "string"
-        ? [id]
-        : [];
-    });
-    this._emit("chat:transcript:repaired", {
-      removedToolCalls: toolCallIds.length,
-      normalizedInputs: 0,
-      toolCallIds
-    });
   }
 
   /** Resolves to `false` when stripping left nothing to persist. */
@@ -14879,61 +14822,9 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     );
   }
 
-  /**
-   * The serialized form last written to (or read from) `think_config` for a
-   * request-context key. Every chat request re-sends its client tools and
-   * body; comparing here turns the per-request write into a no-op when
-   * nothing changed. `undefined` means "not persisted" (row absent).
-   */
-  private _persistedRequestContext: {
-    lastClientTools?: string;
-    lastBody?: string;
-  } = {};
-
-  private _persistRequestContextKey(
-    key: "lastClientTools" | "lastBody",
-    value: unknown
-  ): void {
-    const json = value ? JSON.stringify(value) : undefined;
-    if (this._persistedRequestContext[key] === json) return;
-    if (json === undefined) {
-      this._configDelete(key);
-    } else {
-      this._configSet(key, json);
-    }
-    this._persistedRequestContext[key] = json;
-  }
-
+  /** Write the request context to `think_config`. */
   private _persistClientTools(): void {
-    this._persistRequestContextKey("lastClientTools", this._lastClientTools);
-  }
-
-  private _restoreClientTools(): void {
-    const raw = this._configGet("lastClientTools");
-    this._persistedRequestContext.lastClientTools = raw;
-    if (raw) {
-      try {
-        this._lastClientTools = JSON.parse(raw);
-      } catch {
-        this._lastClientTools = undefined;
-      }
-    }
-  }
-
-  private _persistBody(): void {
-    this._persistRequestContextKey("lastBody", this._lastBody);
-  }
-
-  private _restoreBody(): void {
-    const raw = this._configGet("lastBody");
-    this._persistedRequestContext.lastBody = raw;
-    if (raw) {
-      try {
-        this._lastBody = JSON.parse(raw);
-      } catch {
-        this._lastBody = undefined;
-      }
-    }
+    this._requestContext.persist();
   }
 
   // ── Tool state updates (shared primitives from agents/chat) ─────
@@ -15790,45 +15681,6 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     });
   }
 
-  /**
-   * Names of the tools whose interrupted `input-available` part can still be
-   * resolved by the CLIENT after a restart — i.e. the client tools (no server
-   * `execute`) from the last request, which the SPA answers by replaying a
-   * `tool-result` over the WebSocket. A server tool is intentionally absent:
-   * its `execute()` promise died with the evicted isolate, so nothing will
-   * ever post its result.
-   */
-  private _clientResolvableToolNames(): Set<string> {
-    return clientResolvableToolNames(this._lastClientTools);
-  }
-
-  /**
-   * Whether a part is still awaiting a CLIENT interaction that can genuinely
-   * arrive after a restart, so `waitUntilStable` must keep waiting for it:
-   *  - `approval-requested`: a reconnecting client can replay the approval.
-   *  - `input-available` for a CLIENT tool: the SPA can replay the
-   *    `tool-result` (this is why client-tool recovery works — see the
-   *    `tool-result` handler, which sets `_pendingInteractionPromise`).
-   *
-   * A SERVER tool's `input-available` is deliberately NOT pending. After an
-   * eviction its `execute()` promise is gone and no interaction will ever
-   * resolve it, so treating it as pending wedges `waitUntilStable` forever:
-   * the recovery continuation times out every attempt, burns the attempt
-   * budget on a wait that can never converge, and — if any transient
-   * storage/schedule error throws on the way — the one-shot recovery alarm row
-   * is swallowed and deleted with no terminal `onExhausted` (the half-finished
-   * message wedges silently). Excluding it lets `waitUntilStable` converge so
-   * `continueLastTurn` runs, where the existing transcript-repair pass
-   * (`_repairTranscriptForProvider`) flips the orphan to an errored result and
-   * the model proceeds.
-   */
-  private _partAwaitsClientInteraction(
-    part: UIMessage["parts"][number],
-    clientResolvable: Set<string>
-  ): boolean {
-    return partAwaitsClientInteraction(part, clientResolvable);
-  }
-
   // ── Chat recovery via fibers ───────────────────────────────────
 
   private _resolveChatRecoveryConfig(): ResolvedChatRecoveryConfig {
@@ -15896,16 +15748,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         beginRecoveryAttempt: (rootRequestId) =>
           this._turns.beginRecoveryAttempt(rootRequestId),
         waitUntilStable: (timeout) => this.waitUntilStable({ timeout }),
-        restoreRequestContext: (context) => {
-          if ("lastClientTools" in context) {
-            this._lastClientTools = context.lastClientTools;
-            this._persistClientTools();
-          }
-          if ("lastBody" in context) {
-            this._lastBody = context.lastBody;
-            this._persistBody();
-          }
-        },
+        requestContext: this._requestContext,
         recordTerminalError: (requestId, errorText) =>
           this._recordTerminalChatStatus("error", requestId, errorText),
         reconcileAgentToolChildRuns: () => this._agentToolRuns.reconcileOwn(),
@@ -15944,7 +15787,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       // `isAwaitingClientInteraction()`.
       ensureInteractionStateLoaded: () => {
         if (this._lastClientTools === undefined) {
-          this._restoreClientTools();
+          this._requestContext.restore("lastClientTools");
         }
       },
       // Messenger/workflow reply fibers (`think:messenger-reply`) are NOT chat
@@ -16150,8 +15993,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
           partialParts: context.partialParts,
           recoveryData: liveTurn?.recoveryData ?? null,
           messages: [...this.messages],
-          lastBody: this._lastBody,
-          lastClientTools: this._lastClientTools,
+          ...this._requestContext.snapshot(),
           createdAt: liveTurn?.createdAt ?? context.firstSeenAt
         }),
       resolvePartial: async (keep) => {
@@ -16160,8 +16002,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         return undefined;
       },
       requestContext: () => ({
-        lastBody: this._lastBody,
-        lastClientTools: this._lastClientTools
+        ...this._requestContext.snapshot()
       }),
       // The turn then ends as its stream error, which the caller sends.
       onDeclined: (errorText) =>
@@ -17138,8 +16979,6 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
   private _continuationSpec(connection: Connection) {
     return {
       connection,
-      clientTools: this._lastClientTools,
-      body: undefined,
       errorPrefix: "[Think] Auto-continuation failed:"
     };
   }
@@ -17263,11 +17102,11 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         }),
       // The one turn body every turn runs, for the continuation's
       // connection and tools.
-      run: ({ requestId, connection, clientTools }, signal) =>
+      run: ({ requestId, connection }, signal) =>
         this._runModelTurn(requestId, signal, {
           continuation: true,
           connection,
-          clientTools,
+          clientTools: this._lastClientTools,
           body: this._lastBody
         }),
       failure: this._turnFailureHost(),
@@ -17312,8 +17151,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       this._continuationTurn(),
       {
         requestId: crypto.randomUUID(),
-        connection: undefined,
-        clientTools: this._lastClientTools
+        connection: undefined
       },
       "[Think] Connection-less continuation failed:"
     );

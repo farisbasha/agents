@@ -17,7 +17,7 @@ import type {
 } from "./lifecycle";
 import type { ChatFiberSnapshot } from "./recovery";
 import type { RecoveryAttemptHandle } from "./chat-turns";
-import type { ClientToolSchema } from "./client-tools";
+import type { ChatRequestContext } from "./request-context";
 import {
   handleRecoveryAttemptError,
   runRecoveredTurn
@@ -315,13 +315,11 @@ export interface ChatRecoveryTurnBindings {
   /** The host's `waitUntilStable`. Resolves `false` on timeout. */
   waitUntilStable(timeoutMs: number): Promise<boolean>;
   /**
-   * Store the tools and body a recovered turn runs with. A key that is
-   * absent leaves that part as it is. A key set to `undefined` clears it.
+   * The chat's stored request context. The engine stores the tools and body
+   * a recovered turn runs with through `applyRecovered`: a key that is
+   * absent leaves that part as it is, a key set to `undefined` clears it.
    */
-  restoreRequestContext(context: {
-    lastClientTools?: ClientToolSchema[];
-    lastBody?: Record<string, unknown>;
-  }): void;
+  requestContext: Pick<ChatRequestContext, "applyRecovered">;
   /**
    * Durably record that a request ended with `errorText`, so a client that
    * was away learns the outcome when it reconnects (#1645).
