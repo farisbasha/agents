@@ -94,7 +94,7 @@ const result = await agent.call("callTool", ["square", { number: 5 }]);
 
 ### x402 MCP transport spec
 
-This follows the [x402 MCP transport specification](https://github.com/coinbase/x402/blob/main/specs/transports/mcp.md):
+This follows the [x402 MCP transport specification](https://github.com/coinbase/x402/blob/main/specs/transports-v2/mcp.md):
 
 1. **402 error** — server returns JSON-RPC error with `code: 402` and `PaymentRequirementsResponse`
 2. **Payment payload** — client retries with payment in `_meta["x402/payment"]`
