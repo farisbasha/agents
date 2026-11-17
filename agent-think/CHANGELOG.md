@@ -1,5 +1,14 @@
 # @cloudflare/agent-think
 
+## 0.0.21
+
+### Patch Changes
+
+- Updated dependencies [[`c31b57e`](https://github.com/cloudflare/agents/commit/c31b57e11e19ad532915fcf15dec5f1be916d5b7), [`a2f1216`](https://github.com/cloudflare/agents/commit/a2f1216993aa43982ef3550ec0a05e9a4d6d3175), [`f0f4ed9`](https://github.com/cloudflare/agents/commit/f0f4ed98f6733b1f09b615efe8de0b626b722691), [`7e2e11e`](https://github.com/cloudflare/agents/commit/7e2e11e55825e7298ce3e0690b47414c2fcd71a9), [`5c33d89`](https://github.com/cloudflare/agents/commit/5c33d89791d6a00c6ea64cf7790fa753e3e5cbfd), [`47ccc29`](https://github.com/cloudflare/agents/commit/47ccc29e16e04f27881a3bed7f812974a1520b46), [`5071d3c`](https://github.com/cloudflare/agents/commit/5071d3cda939972fb532c93e9b46942b36d8f5d7), [`88eb62c`](https://github.com/cloudflare/agents/commit/88eb62c9d5a5dd3472d71e0f137c4eaa1bed0920), [`c31b57e`](https://github.com/cloudflare/agents/commit/c31b57e11e19ad532915fcf15dec5f1be916d5b7), [`e0f95e5`](https://github.com/cloudflare/agents/commit/e0f95e587078db5b1f53575b8494e3979a519ff3), [`46daba4`](https://github.com/cloudflare/agents/commit/46daba47a5f675aae42aa0514ce96437c804f3cd), [`d6b4441`](https://github.com/cloudflare/agents/commit/d6b4441fbc2cf6909d61480a9c182181a924a7ff), [`cff5dd1`](https://github.com/cloudflare/agents/commit/cff5dd1cfdd1f404bff09200f5132087750c1883), [`366d5b5`](https://github.com/cloudflare/agents/commit/366d5b5baf846b4669a2ecd0e61e104aa634432b), [`ec57858`](https://github.com/cloudflare/agents/commit/ec57858a77533a09512c50410de1ccbbe3632caa), [`1f3bd92`](https://github.com/cloudflare/agents/commit/1f3bd9215239ccd973da87506d4771ac13a20bd2), [`f41f395`](https://github.com/cloudflare/agents/commit/f41f3956bfc6cf7c95dde6e28f7992531895e73f), [`9b54e51`](https://github.com/cloudflare/agents/commit/9b54e51a2f68b8aa7b5e42ad4635351c889670c0), [`0f2727a`](https://github.com/cloudflare/agents/commit/0f2727a2da0c6a6ffb0e54a8207e29120f7ca093)]:
+  - agents@0.34.0
+  - @cloudflare/ai-chat@0.12.3
+  - @cloudflare/think@0.24.0
+
 ## 0.0.20
 
 ### Patch Changes
