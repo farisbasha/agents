@@ -130,7 +130,8 @@ export type FailingReaderPrelude =
  */
 function makeFailingSSEResponse(
   errorMessage: string,
-  prelude: FailingReaderPrelude = "partial"
+  prelude: FailingReaderPrelude = "partial",
+  responseHeaders?: Record<string, string>
 ) {
   const encoder = new TextEncoder();
   const chunks = {
@@ -164,7 +165,13 @@ function makeFailingSSEResponse(
         );
       }
       await new Promise((resolve) => setTimeout(resolve, 10));
-      controller.error(new Error(errorMessage));
+      // A provider error carries its response headers (AI SDK
+      // `APICallError.responseHeaders`).
+      controller.error(
+        responseHeaders
+          ? Object.assign(new Error(errorMessage), { responseHeaders })
+          : new Error(errorMessage)
+      );
     }
   });
   return new Response(stream, {
@@ -2180,10 +2187,13 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
 
     if (this._failingTurn) {
       this._failingReaderCalls++;
-      const { message, remaining, prelude } = this._failingTurn;
+      const { message, remaining, prelude, responseHeaders } =
+        this._failingTurn;
       this._failingTurn =
-        remaining > 1 ? { message, remaining: remaining - 1, prelude } : null;
-      return makeFailingSSEResponse(message, prelude);
+        remaining > 1
+          ? { message, remaining: remaining - 1, prelude, responseHeaders }
+          : null;
+      return makeFailingSSEResponse(message, prelude, responseHeaders);
     }
 
     if (this._emitStreamError) {
@@ -3169,6 +3179,7 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
     message: string;
     remaining: number;
     prelude: FailingReaderPrelude;
+    responseHeaders?: Record<string, string>;
   } | null = null;
   private _failingReaderCalls = 0;
 
@@ -3192,7 +3203,11 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
   async driveFailingReaderTurnForTest(
     message: string,
     turns = 1,
-    options: { prelude?: FailingReaderPrelude; priorAssistant?: boolean } = {}
+    options: {
+      prelude?: FailingReaderPrelude;
+      priorAssistant?: boolean;
+      responseHeaders?: Record<string, string>;
+    } = {}
   ): Promise<SaveMessagesResult["status"]> {
     if (options.priorAssistant) {
       await this.persistMessages([
@@ -3211,7 +3226,8 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
     this._failingTurn = {
       message,
       remaining: turns,
-      prelude: options.prelude ?? "partial"
+      prelude: options.prelude ?? "partial",
+      responseHeaders: options.responseHeaders
     };
     const result = await this.saveMessages((current) => [
       ...current,
@@ -3623,6 +3639,19 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
       Reflect.deleteProperty(engine, "beginIncident");
       throw new Error("incident write failed");
     };
+  }
+
+  /** The backoff, in seconds, of the recovery Task scheduled last. */
+  getScheduledRecoveryDelayForTest(): number | null {
+    return (
+      this.sql<{ delay: number | null }>`
+        SELECT json_extract(input, '$.delaySeconds') AS delay
+        FROM cf_agents_task_runs
+        WHERE definition = ${CHAT_RECOVERY_TASK_NAME}
+        ORDER BY created_at DESC
+        LIMIT 1
+      `[0]?.delay ?? null
+    );
   }
 
   getScheduleCountForCallback(callback: string): number {
